@@ -1,1 +1,375 @@
 
+import numpy as np
+from scipy.stats import rice
+from scipy.special import i0
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+import matplotlib
+
+
+def ivim_signal(b, S0, D, f, D_star):
+    """
+    Calculates the IVIM signal under the bi-exponential model.
+
+    Args:
+        b (array-like): b-values
+        S0 (float): Initial signal amplitude 
+        D (float): True diffusion coefficient
+        f (float): Perfusion fraction
+        D_star (float): Pseudodiffusion coefficient
+
+    Returns:
+        array-like: IVIM signal values
+    """
+    return S0 * (f * np.exp(-b * D_star) + (1 - f) * np.exp(-b * D)) 
+
+def jacobian(b, S0, D, f, D_star):
+    """
+    Calculates the Jacobian matrix of the IVIM signal model.
+
+    Args:
+        b (array-like): b-values
+        S0 (float): Initial signal amplitude 
+        D (float): True diffusion coefficient
+        f (float): Perfusion fraction
+        D_star (float): Pseudodiffusion coefficient
+
+    Returns:
+        numpy.ndarray: Jacobian matrix
+    """
+    dSdS0 = f * np.exp(-b * D_star) + (1 - f) * np.exp(-b * D)
+    dSdD = -S0 * (1 - f) * b * np.exp(-b * D)
+    dSdF = S0 * (np.exp(-b * D_star) - np.exp(-b * D))
+    dSdDstar = -S0 * f * b * np.exp(-b * D_star)
+    return np.stack([dSdS0, dSdD, dSdF, dSdDstar], axis=1)
+
+
+def crlb(b, S0, D, f, D_star, sigma):
+    """
+    Calculates the Cramer-Rao Lower Bound (CRLB) for IVIM parameters.
+    With the assumption of Gaussian noise (so this approximation 
+    does not account for noise floor effects)
+    Without accounting for TE-lengthening required for higher b values
+
+    Args:
+        b (array-like): b-values
+        S0 (float): Initial signal amplitude 
+        D (float): True diffusion coefficient
+        f (float): Perfusion fraction
+        D_star (float): Pseudodiffusion coefficient
+        sigma (float): Standard deviation of Rician noise
+
+    Returns:
+        numpy.ndarray: Covariance matrix (the diagonal elements are CRLBs)
+    """
+    J = jacobian(b, S0, D, f, D_star)
+    fisher_info = (J.T @ J) / sigma**2 
+    return np.linalg.inv(fisher_info)  
+
+# Example usage:
+b_values = np.array([0, 10, 100, 200, 500, 800])
+true_S0 = 1.0  # mm^2/s
+true_D = 0.001  # mm^2/s
+true_f = 0.15
+true_D_star = 0.02  # mm^2/s
+sigma = 0.05  # Standard deviation of noise
+
+crlb_matrix = crlb(b_values, true_S0, true_D, true_f, true_D_star, sigma)
+
+std_D = np.sqrt(crlb_matrix[1,1]);
+std_f = np.sqrt(crlb_matrix[2,2]);
+std_D_star = np.sqrt(crlb_matrix[3,3]);
+
+#print("Sqrt CRLB for D:", std_D)
+#print("Sqrt CRLB for f:", std_f)
+#print("Sqrt CRLB for D*:", std_D_star) 
+
+
+error_metric = std_D/true_D + std_f +  std_D_star/true_D_star # Not normalizing by true_f, which can be zero
+print("Error metric", error_metric) 
+Error metric 2.514208947502162
+# Cost function that penalizes standard deviations predicted by the CRLB
+def objective_function_range(b, S0s, Ds, fs, D_stars, sigma):       
+    b = np.clip(b,0,1500)
+    error_metric = 0.0
+    error_metrics = []
+    for S0 in S0s:
+        for D in Ds:
+            for f in fs:
+                for D_star in D_stars:
+                    crlb_matrix = crlb(b, S0, D, f, D_star, sigma)
+                    std_D = np.sqrt(crlb_matrix[1,1]);
+                    std_f = np.sqrt(crlb_matrix[2,2]);
+                    std_D_star = np.sqrt(crlb_matrix[3,3]);
+                    cur_error =  std_D/D + std_f +  std_D_star/D_star # Not normalizing by true_f, which can be zero
+                    error_metrics = np.append(error_metrics,(cur_error))
+    # Maximum error across all true parameter settings (could also take the average, or some other combination)
+    error_metric = np.max(error_metrics)
+    return error_metric
+
+
+# Measures of uncertainty for each of the IVIM parameters 
+def uncertainty_measures(b, S0s, Ds, fs, D_stars, sigma):       
+    b = np.clip(b,0,1500)
+    error_metric = 0.0
+    error_metrics = []
+    error_metrics_D = []
+    error_metrics_f = []
+    error_metrics_D_star = []
+    for S0 in S0s:
+        for D in Ds:
+            for f in fs:
+                for D_star in D_stars:
+                    crlb_matrix = crlb(b, S0, D, f, D_star, sigma)
+                    std_D = np.sqrt(crlb_matrix[1,1]);
+                    std_f = np.sqrt(crlb_matrix[2,2]);
+                    std_D_star = np.sqrt(crlb_matrix[3,3]);
+                    cur_error =  std_D/D + std_f +  std_D_star/D_star # Not normalizing by true_f, which can be zero
+                    error_metrics_D = np.append(error_metrics_D,(std_D/D))
+                    error_metrics_D_star = np.append(error_metrics_D_star,(std_D_star/D_star))
+                    error_metrics_f = np.append(error_metrics_f,(std_f))
+                    error_metrics = np.append(error_metrics,(cur_error))
+    # Maximum error across all true parameter settings (could also take the average, or some other combination)
+    error_metric = np.max(error_metrics)
+    return error_metric, error_metrics_D, error_metrics_f, error_metrics_D_star
+# True parameters from Eric's excel sheet (July 2024)
+trueParams= np.dtype([('name', (np.str_, 30)), ('D', np.float64),('f', np.float64), ('Dstar', np.float64)]) 
+myTrueParams = np.array([('Kidney Cortex 1.5T', 1.966/1000, 19.9/100, 50.8/1000), 
+                         ('Kidney Cortex 3.0T', 1.919/1000, 20.1/100, 24.964/1000), 
+                         ('Kidney Medulla 1.5T', 1.884/1000, 17.5/100, 57.35/1000),
+                         ('Kidney Medulla 3.0T', 1.796/1000, 18/100, 29.02/1000),
+                         ('Kidney Average', 1.891/1000, 18.875/100, 40.534/1000),
+                         ('Liver', 1.09/1000, 23.05/100, 70.02/1000),
+                         ('Muscle', 1.47/1000, 10.34/100, 30.88/1000),
+                         ('Breast Malignant', 0.9676/1000, 11.305/100, 37.76/1000),
+                         ('Breast Benign', 1.4305/1000, 7.004/100, 52.33/1000),
+                         ('Pancreas Malignant', 1.396/1000, 12.394/100, 22.16/1000),
+                         ('Pancreas Benign', 1.409/1000, 20.033/100, 25.39/1000)
+                        ], 
+       dtype=trueParams) 
+# For each example of tissue parameters, optimize the b values
+allb = np.zeros([myTrueParams.size,4])
+for k in range(myTrueParams.size):
+
+    # Collect current tissue parameters
+    print("Current tissue parameters:", myTrueParams[k])
+    true_S0s = np.array([1.0])
+    true_Ds = np.array([myTrueParams[k]['D']])
+    true_fs = np.array([myTrueParams[k]['f']])
+    true_D_stars = np.array([myTrueParams[k]['Dstar']])
+    sigma = 0.04  # Standard deviation of noise (assuming SNR = true_S0s / sigma for the b=0 signal)
+
+    # Define fixed parameters for optimization
+    fixed_params = {'S0s': true_S0s, 'Ds': true_Ds, 'fs': true_fs, 'D_stars':true_D_stars, 'sigma':sigma}
+
+    # Choose an optimization method and provide an initial guess for x
+    method = 'Nelder-Mead'  # Other options: 'differential_evolution', etc.
+    b0 = np.logspace(0, 2.5, 4, base=10.0)
+
+    #print("Initial b values:", np.round(b0))
+
+    # Minimize the objective function (using args to pass fixed parameters)
+    result = minimize(objective_function_range, b0, method=method, args=(fixed_params['S0s'], fixed_params['Ds'], fixed_params['fs'], fixed_params['D_stars'], fixed_params['sigma']),options={'maxiter': 50000, 'maxfev': 200000})
+    b_opt = np.clip(result.x,0,2500)
+    b0 = b_opt
+    result = minimize(objective_function_range, b0, method=method, args=(fixed_params['S0s'], fixed_params['Ds'], fixed_params['fs'], fixed_params['D_stars'], fixed_params['sigma']),options={'maxiter': 50000, 'maxfev': 200000})
+    b_opt = np.clip(result.x,0,2500)
+    b_opt = np.sort(b_opt)
+
+    # Check if the optimization was successful
+    if not result.success:
+        print("Optimization failed!")
+
+    print("Optimized b values:", np.round(b_opt))
+    allb[k,:] = b_opt
+
+    # Calculate some measure of uncertainty for each of the parameters in each of the organs
+    # Note that these measures of uncertainty scale with the noise assumed in the signal, so the absolute values need to be interpreted with care
+    error_metric, error_metrics_D, error_metrics_f, error_metrics_D_star = uncertainty_measures(b_opt, true_S0s, true_Ds, true_fs, true_D_stars, sigma)
+    print("Uncertainty for D (stdD/D):",  "{:.2f}".format(np.mean(error_metrics_D)))
+    print("Uncertainty for f (stdf):",  "{:.2f}".format(np.mean(error_metrics_f)))
+    print("Uncertainty for Dstar (stdDstar/Dstar):",  "{:.2f}".format(np.mean(error_metrics_D_star)))
+    
+Current tissue parameters: ('Kidney Cortex 1.5T', 0.001966, 0.199, 0.0508)
+Optimized b values: [  0.  17. 105. 744.]
+Uncertainty for D (stdD/D): 0.18
+Uncertainty for f (stdf): 0.07
+Uncertainty for Dstar (stdDstar/Dstar): 0.79
+Current tissue parameters: ('Kidney Cortex 3.0T', 0.001919, 0.201, 0.024964)
+Optimized b values: [  0.  31. 175. 864.]
+Uncertainty for D (stdD/D): 0.21
+Uncertainty for f (stdf): 0.11
+Uncertainty for Dstar (stdDstar/Dstar): 0.91
+Current tissue parameters: ('Kidney Medulla 1.5T', 0.001884, 0.175, 0.05735)
+Optimized b values: [  0.  15.  97. 764.]
+Uncertainty for D (stdD/D): 0.17
+Uncertainty for f (stdf): 0.07
+Uncertainty for Dstar (stdDstar/Dstar): 0.87
+Current tissue parameters: ('Kidney Medulla 3.0T', 0.001796, 0.18, 0.02902)
+Optimized b values: [  0.  28. 162. 890.]
+Uncertainty for D (stdD/D): 0.20
+Uncertainty for f (stdf): 0.09
+Uncertainty for Dstar (stdDstar/Dstar): 0.95
+Current tissue parameters: ('Kidney Average', 0.001891, 0.18875, 0.040534)
+Optimized b values: [  0.  21. 125. 801.]
+Uncertainty for D (stdD/D): 0.18
+Uncertainty for f (stdf): 0.08
+Uncertainty for Dstar (stdDstar/Dstar): 0.86
+Current tissue parameters: ('Liver', 0.00109, 0.2305, 0.07002)
+Optimized b values: [   0.   13.   93. 1179.]
+Uncertainty for D (stdD/D): 0.17
+Uncertainty for f (stdf): 0.06
+Uncertainty for Dstar (stdDstar/Dstar): 0.62
+Current tissue parameters: ('Muscle', 0.00147, 0.1034, 0.03088)
+Optimized b values: [   0.   27.  167. 1078.]
+Uncertainty for D (stdD/D): 0.17
+Uncertainty for f (stdf): 0.08
+Uncertainty for Dstar (stdDstar/Dstar): 1.57
+Current tissue parameters: ('Breast Malignant', 0.0009676, 0.11305, 0.03776)
+Optimized b values: [   0.   23.  160. 1775.]
+Uncertainty for D (stdD/D): 0.15
+Uncertainty for f (stdf): 0.07
+Uncertainty for Dstar (stdDstar/Dstar): 1.31
+Current tissue parameters: ('Breast Benign', 0.0014305, 0.07004, 0.05233)
+Optimized b values: [   0.   17.  115. 1057.]
+Uncertainty for D (stdD/D): 0.15
+Uncertainty for f (stdf): 0.07
+Uncertainty for Dstar (stdDstar/Dstar): 2.13
+Current tissue parameters: ('Pancreas Malignant', 0.001396, 0.12394, 0.02216)
+Optimized b values: [   0.   36.  214. 1176.]
+Uncertainty for D (stdD/D): 0.19
+Uncertainty for f (stdf): 0.09
+Uncertainty for Dstar (stdDstar/Dstar): 1.39
+Current tissue parameters: ('Pancreas Benign', 0.001409, 0.20033, 0.02539)
+Optimized b values: [   0.   32.  190. 1103.]
+Uncertainty for D (stdD/D): 0.19
+Uncertainty for f (stdf): 0.09
+Uncertainty for Dstar (stdDstar/Dstar): 0.84
+allb = np.round(allb*10)/10
+for k in range(myTrueParams.size):
+    print(allb[k,0],  allb[k,1],allb[k,2],allb[k,3] )
+0.0 16.8 104.7 743.9
+0.0 31.4 175.3 864.3
+0.0 15.1 97.3 764.3
+0.0 27.9 161.8 890.0
+0.0 20.6 125.2 800.6
+0.0 12.9 92.8 1179.4
+0.0 27.1 167.3 1078.1
+0.0 23.3 159.9 1775.2
+0.0 16.8 115.1 1056.6
+0.0 36.5 213.9 1176.4
+0.0 32.3 189.8 1103.5
+b_abbr = np.array([0,200,800])
+def objective_function_range_sub(b, S0s, Ds, fs, D_stars, sigma):
+    return objective_function_range(np.sort(np.append(b_abbr,b)), S0s, Ds, fs, D_stars, sigma)
+
+# For each example of tissue parameters, optimize the b values
+allb = np.zeros([myTrueParams.size,4])
+allb_sub = np.zeros([myTrueParams.size,4])
+for k in range(myTrueParams.size):
+
+    # Collect current tissue parameters
+    print("Current tissue parameters:", myTrueParams[k])
+    true_S0s = np.array([1.0])
+    true_Ds = np.array([myTrueParams[k]['D']])
+    true_fs = np.array([myTrueParams[k]['f']])
+    true_D_stars = np.array([myTrueParams[k]['Dstar']])
+    sigma = 0.04  # Standard deviation of noise (assuming SNR = true_S0s / sigma for the b=0 signal)
+
+    # Define fixed parameters for optimization
+    fixed_params = {'S0s': true_S0s, 'Ds': true_Ds, 'fs': true_fs, 'D_stars':true_D_stars, 'sigma':sigma}
+
+    # Choose an optimization method and provide an initial guess for x
+    method = 'Nelder-Mead'  # Other options: 'differential_evolution', etc.
+    b0 = np.logspace(0, 2.5, 4, base=10.0)
+
+    #print("Initial b values:", np.round(b0))
+
+    # Minimize the objective function (using args to pass fixed parameters)
+    result = minimize(objective_function_range, b0, method=method, args=(fixed_params['S0s'], fixed_params['Ds'], fixed_params['fs'], fixed_params['D_stars'], fixed_params['sigma']),options={'maxiter': 50000, 'maxfev': 200000})
+    b_opt = np.clip(result.x,0,2500)
+    b0 = b_opt
+    result = minimize(objective_function_range, b0, method=method, args=(fixed_params['S0s'], fixed_params['Ds'], fixed_params['fs'], fixed_params['D_stars'], fixed_params['sigma']),options={'maxiter': 50000, 'maxfev': 200000})
+    b_opt = np.clip(result.x,0,2500)
+    b_opt = np.sort(b_opt)
+
+    b0_sub = 20
+    result_sub = minimize(objective_function_range_sub, b0_sub, method=method, args=(fixed_params['S0s'], fixed_params['Ds'], fixed_params['fs'], fixed_params['D_stars'], fixed_params['sigma']),options={'maxiter': 50000, 'maxfev': 200000})
+    b_opt_sub = np.clip(result_sub.x,0,2500)
+    b0_sub = b_opt_sub
+    result_sub = minimize(objective_function_range_sub, b0_sub, method=method, args=(fixed_params['S0s'], fixed_params['Ds'], fixed_params['fs'], fixed_params['D_stars'], fixed_params['sigma']),options={'maxiter': 50000, 'maxfev': 200000})
+    b_opt_sub = np.clip(np.sort(np.append(b_abbr,result_sub.x)),0,2500)
+
+    # Check if the optimization was successful
+    if not result.success:
+        print("Optimization failed!")
+
+    print("Optimized b values:", np.round(b_opt), ", (subset) ", np.round(b_opt_sub))
+    allb[k,:] = b_opt
+#    print("Optimized b values:", np.round(b_opt_sub), " (subset)")
+    allb[k,:] = b_opt_sub
+
+    # Calculate some measure of uncertainty for each of the parameters in each of the organs
+    # Note that these measures of uncertainty scale with the noise assumed in the signal, so the absolute values need to be interpreted with care
+    error_metric, error_metrics_D, error_metrics_f, error_metrics_D_star = uncertainty_measures(b_opt, true_S0s, true_Ds, true_fs, true_D_stars, sigma)
+    error_metric_sub, error_metrics_sub_D, error_metrics_sub_f, error_metrics_sub_D_star = uncertainty_measures(b_opt_sub, true_S0s, true_Ds, true_fs, true_D_stars, sigma)
+    print("Uncertainty for D (stdD/D):",  "{:.2f}".format(np.mean(error_metrics_D)), ", (subset) {:.2f}".format(np.mean(error_metrics_sub_D)))
+    print("Uncertainty for f (stdf):",  "{:.2f}".format(np.mean(error_metrics_f)),  ", (subset) {:.2f}".format(np.mean(error_metrics_sub_f)))
+    print("Uncertainty for Dstar (stdDstar/Dstar):",  "{:.2f}".format(np.mean(error_metrics_D_star)),  ", (subset) {:.2f}".format(np.mean(error_metrics_sub_D_star)))
+    
+Current tissue parameters: ('Kidney Cortex 1.5T', 0.001966, 0.199, 0.0508)
+Optimized b values: [  0.  17. 105. 744.] , (subset)  [  0.  14. 200. 800.]
+Uncertainty for D (stdD/D): 0.18 , (subset) 0.21
+Uncertainty for f (stdf): 0.07 , (subset) 0.11
+Uncertainty for Dstar (stdDstar/Dstar): 0.79 , (subset) 0.92
+Current tissue parameters: ('Kidney Cortex 3.0T', 0.001919, 0.201, 0.024964)
+Optimized b values: [  0.  31. 175. 864.] , (subset)  [  0.  31. 200. 800.]
+Uncertainty for D (stdD/D): 0.21 , (subset) 0.22
+Uncertainty for f (stdf): 0.11 , (subset) 0.11
+Uncertainty for Dstar (stdDstar/Dstar): 0.91 , (subset) 0.92
+Current tissue parameters: ('Kidney Medulla 1.5T', 0.001884, 0.175, 0.05735)
+Optimized b values: [  0.  15.  97. 764.] , (subset)  [  0.  13. 200. 800.]
+Uncertainty for D (stdD/D): 0.17 , (subset) 0.20
+Uncertainty for f (stdf): 0.07 , (subset) 0.10
+Uncertainty for Dstar (stdDstar/Dstar): 0.87 , (subset) 1.03
+Current tissue parameters: ('Kidney Medulla 3.0T', 0.001796, 0.18, 0.02902)
+Optimized b values: [  0.  28. 162. 890.] , (subset)  [  0.  27. 200. 800.]
+Uncertainty for D (stdD/D): 0.20 , (subset) 0.20
+Uncertainty for f (stdf): 0.09 , (subset) 0.10
+Uncertainty for Dstar (stdDstar/Dstar): 0.95 , (subset) 0.98
+Current tissue parameters: ('Kidney Average', 0.001891, 0.18875, 0.040534)
+Optimized b values: [  0.  21. 125. 801.] , (subset)  [  0.  19. 200. 800.]
+Uncertainty for D (stdD/D): 0.18 , (subset) 0.21
+Uncertainty for f (stdf): 0.08 , (subset) 0.10
+Uncertainty for Dstar (stdDstar/Dstar): 0.86 , (subset) 0.94
+Current tissue parameters: ('Liver', 0.00109, 0.2305, 0.07002)
+Optimized b values: [   0.   13.   93. 1179.] , (subset)  [  0.  11. 200. 800.]
+Uncertainty for D (stdD/D): 0.17 , (subset) 0.21
+Uncertainty for f (stdf): 0.06 , (subset) 0.08
+Uncertainty for Dstar (stdDstar/Dstar): 0.62 , (subset) 0.70
+Current tissue parameters: ('Muscle', 0.00147, 0.1034, 0.03088)
+Optimized b values: [   0.   27.  167. 1078.] , (subset)  [  0.  26. 200. 800.]
+Uncertainty for D (stdD/D): 0.17 , (subset) 0.18
+Uncertainty for f (stdf): 0.08 , (subset) 0.09
+Uncertainty for Dstar (stdDstar/Dstar): 1.57 , (subset) 1.62
+Current tissue parameters: ('Breast Malignant', 0.0009676, 0.11305, 0.03776)
+Optimized b values: [   0.   23.  160. 1775.] , (subset)  [  0.  22. 200. 800.]
+Uncertainty for D (stdD/D): 0.15 , (subset) 0.19
+Uncertainty for f (stdf): 0.07 , (subset) 0.08
+Uncertainty for Dstar (stdDstar/Dstar): 1.31 , (subset) 1.39
+Current tissue parameters: ('Breast Benign', 0.0014305, 0.07004, 0.05233)
+Optimized b values: [   0.   17.  115. 1057.] , (subset)  [  0.  15. 200. 800.]
+Uncertainty for D (stdD/D): 0.15 , (subset) 0.17
+Uncertainty for f (stdf): 0.07 , (subset) 0.09
+Uncertainty for Dstar (stdDstar/Dstar): 2.13 , (subset) 2.38
+Current tissue parameters: ('Pancreas Malignant', 0.001396, 0.12394, 0.02216)
+Optimized b values: [   0.   36.  214. 1176.] , (subset)  [  0.  36. 200. 800.]
+Uncertainty for D (stdD/D): 0.19 , (subset) 0.19
+Uncertainty for f (stdf): 0.09 , (subset) 0.10
+Uncertainty for Dstar (stdDstar/Dstar): 1.39 , (subset) 1.44
+Current tissue parameters: ('Pancreas Benign', 0.001409, 0.20033, 0.02539)
+Optimized b values: [   0.   32.  190. 1103.] , (subset)  [  0.  32. 200. 800.]
+Uncertainty for D (stdD/D): 0.19 , (subset) 0.20
+Uncertainty for f (stdf): 0.09 , (subset) 0.09
+Uncertainty for Dstar (stdDstar/Dstar): 0.84 , (subset) 0.86
+ 
